@@ -1,0 +1,82 @@
+# Build stage
+FROM oven/bun:1-alpine AS builder
+
+# Set working directory
+WORKDIR /app
+
+# Install build dependencies for native modules
+RUN apk add --no-cache git python3 make g++
+
+# Copy package files first for better Docker layer caching
+COPY frontend/package.json frontend/bun.lock ./
+
+# Install all dependencies using bun
+RUN bun install --frozen-lockfile
+
+# Copy frontend source code
+COPY frontend/ .
+
+# Build arguments for environment variables
+ARG EXPO_PUBLIC_API_BASE_URL
+ARG NODE_ENV=production
+
+# Set environment variables for build
+ENV EXPO_PUBLIC_API_BASE_URL=$EXPO_PUBLIC_API_BASE_URL
+ENV NODE_ENV=$NODE_ENV
+
+# Build web app with optimizations
+RUN bunx expo export --platform web --output-dir dist
+
+# Production stage with nginx
+FROM nginx:1.25-alpine AS production
+
+# Install curl for health checks and bash for scripts
+RUN apk add --no-cache curl bash
+
+# Copy optimized nginx configuration
+COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
+
+# Copy built app from builder stage
+COPY --from=builder /app/dist /usr/share/nginx/html
+# Ensure custom service worker is available at root
+COPY frontend/web/service-worker.js /usr/share/nginx/html/service-worker.js
+COPY frontend/web/manifest.json /usr/share/nginx/html/manifest.json
+# Copy icons to root for PWA and web
+COPY --from=builder /app/assets/images/icon.png /usr/share/nginx/html/icon.png
+COPY --from=builder /app/assets/images/favicon.png /usr/share/nginx/html/favicon.png
+COPY --from=builder /app/assets/images/icon.png /usr/share/nginx/html/assets/images/icon.png
+COPY --from=builder /app/assets/images/favicon.png /usr/share/nginx/html/assets/images/favicon.png
+
+# Copy environment variable scripts
+COPY scripts/inject-env-vars.sh /docker-entrypoint.d/30-inject-env-vars.sh
+COPY scripts/validate-env.sh /docker-entrypoint.d/20-validate-env.sh
+
+# Make the scripts executable
+RUN chmod +x /docker-entrypoint.d/30-inject-env-vars.sh && \
+    chmod +x /docker-entrypoint.d/20-validate-env.sh
+
+# Create non-root user for security
+RUN addgroup -g 1001 -S nginxuser && \
+    adduser -S nginxuser -u 1001 -G nginxuser
+
+# Set proper ownership and permissions
+RUN chown -R nginxuser:nginxuser /usr/share/nginx/html && \
+    chmod -R 755 /usr/share/nginx/html && \
+    chown -R nginxuser:nginxuser /var/cache/nginx && \
+    chown -R nginxuser:nginxuser /var/log/nginx && \
+    chown -R nginxuser:nginxuser /etc/nginx/conf.d && \
+    touch /var/run/nginx.pid && \
+    chown -R nginxuser:nginxuser /var/run/nginx.pid
+
+# Switch to non-root user
+USER nginxuser
+
+# Expose port 3000 (as specified in design document)
+EXPOSE 3000
+
+# Health check with improved configuration
+HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+  CMD curl -f http://localhost:3000/health || exit 1
+
+# Start nginx with optimized configuration
+CMD ["nginx", "-g", "daemon off;"]
